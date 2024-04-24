@@ -1,0 +1,12 @@
+pkgbase = aa-lint-git
+	pkgdesc = Lint AppArmor Profiles
+	pkgver = 1
+	pkgrel = 1
+	arch = any
+	depends = python
+	depends = python-termcolor
+	provides = aa-lint
+	source = git+https://github.com/kkernick/aa-lint.git
+	sha256sums = SKIP
+
+pkgname = aa-lint-git
