@@ -1,6 +1,6 @@
 pkgname=aa-lint-git
 pkgdesc="Lint AppArmor Profiles"
-pkgver=1
+pkgver=r2.eb40d9a
 pkgrel=1
 
 source=("git+https://github.com/kkernick/aa-lint.git")

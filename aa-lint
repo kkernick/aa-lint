@@ -488,10 +488,7 @@ def find_duplicated_rules(permission: str, path: Path, local: Profile):
                     ["Contains redundant rule", l_path, l_permission, "which is contained within the rule " + path.path,
                      permission]), "yellow")
                 local.modified = True
-                try:
-                    local.values.pop(l_path)
-                except KeyError: 
-                    pass
+                local.values.pop(l_path)
 
 def find_inherited_rules(permission: str, path: Path, local: Profile):
     global combined_rules
@@ -504,10 +501,7 @@ def find_inherited_rules(permission: str, path: Path, local: Profile):
                 ["Contains redundant rule", path.path, permission, "which is contained within the rule ", l_path,
                     l_permission, "from abstraction"]), "yellow")
             local.modified = True
-            try:
-                local.values.pop(path.path)
-            except KeyError:
-                pass
+            local.values.pop(path.path)
             return
 
 def get_header(include: str):
@@ -564,12 +558,9 @@ def find_variable_substitutions(permission: str, path: Path, local: Profile):
                                   " ".join([path.path, "Can use variable", variable, "instead of", value]), "yellow")
                     if value.endswith("/"):
                         value = value[:-1]
-                    try:
-                        local.values.pop(path.path)
-                        local.values[path.path.replace(value, variable)] = permission
-                        local.modified = True
-                    except KeyError: 
-                        pass
+                    local.values.pop(path.path)
+                    local.values[path.path.replace(value, variable)] = permission
+                    local.modified = True
 
 
 def find_same_path(permission: str, path: Path, local: Profile):
@@ -619,10 +610,7 @@ def find_same_path(permission: str, path: Path, local: Profile):
                  "to form", working]), "yellow")
             local.modified = True
             local.values.pop(current_path)
-            try:
-                local.values.pop(l_path)
-            except KeyError:
-                pass
+            local.values.pop(l_path)
             local.values[working] = permission
             current_path = working
             value = end
