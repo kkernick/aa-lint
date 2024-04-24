@@ -1,0 +1,752 @@
+#!/bin/python
+
+import os
+import sys
+
+from termcolor import colored
+from copy import deepcopy
+from os import environ
+
+apparmor_dir = environ["XDG_DATA_HOME"] + "/apparmor.d/"
+
+# While the parser can be correct, sometimes the substitution really isn't what was intended, and opens up the profile
+# to more permission than it otherwise should. These are hand-curated for when it clearly shouldn't be allowed.
+bastardization_rules = {
+    "/usr": "@{system_share_dirs}",  # While valid, not intended when we're running binaries from /usr/bin.
+    "[0-9]": "@{uid}",  # Might be a bug on the parser's side. Would likely break profiles.
+}
+
+substitutions = 0
+invalid_exec = 0
+combined_rules = 0
+
+abstractions = {}
+tunables = {}
+
+global_variables = {
+    "@{HOME}": "/home/*",
+    "@{system_share_dirs}": "/usr/share",
+    "@{user_share_dirs}": "@{HOME}/.local/share"
+}
+
+class Profile:
+    def __init__(self):
+        self.name: str = ""
+        self.path: str = ""
+        self.flags: str = ""
+        self.parent = None
+        self.header = False
+        self.children = []
+        self.local_includes = []
+        self.global_includes = []
+        self.values = {}
+        self.variables = {}
+        self.unsupported = []
+        self.indices = {
+            "variables": {},
+            "values": {}
+        }
+
+        self.modified = False
+
+
+class RegularExpression:
+    def __init__(self, string: str):
+        if "*" in string:
+            if "**" in string:
+                find = "**"
+                self.recursive = True
+            else:
+                find = "*"
+                self.recursive = False
+            location = string.find(find)
+            if location == 0:
+                self.left = ""
+            else:
+                self.left = string[:location]
+
+            if location + len(find) == len(string):
+                self.right = ""
+            else:
+                self.right = string[location + len(find):]
+
+    def match(self, string: str) -> bool:
+        if "*" in string:
+            return self.match_exp(RegularExpression(string))
+        if string.startswith(self.left):
+            string = string.replace(self.left, "")
+        else:
+            return False
+
+        if self.right == "":
+            if not self.recursive and "/" in string:
+                return False
+            return string != self.right
+
+        elif string.endswith(self.right):
+            return True
+        return False
+
+    def match_exp(self, expression) -> bool:
+        if self.left != "":
+            if self.left != expression.left:
+                return False
+        if self.right != "":
+            if self.right != expression.right:
+                return False
+        return True
+
+
+class Path:
+    def _path_parser(self, paths: list[str], profile: Profile) -> list:
+        ret = []
+        for path in paths:
+            if "{" in path and path.count("{") != path.count("@{"):
+                local = []
+                symbol = bounder(path)
+                for resolved in splitter(symbol):
+                    local.append(path.replace(symbol, resolved))
+                ret += self._path_parser(local, profile)
+            else:
+                ret.append(path)
+        return ret
+
+    def _resolve_variables(self, path: str, profile: Profile) -> str:
+        global abstractions, tunables, global_variables
+        variables = profile.indices["variables"]
+        while "@{" in path:
+            start = path.find("@{")
+            variable = path[start:path.find("}", start) + 1]
+            if variable in global_variables:
+                path = path.replace(variable, global_variables[variable])
+            elif variable in variables:
+                path = path.replace(variable, variables[variable])
+            else:
+                profile_issue(profile.path, profile, "Unresolved variable " + variable, "red")
+                exit(-1)
+        return path.replace("//", "/").replace("/ /", "/")
+
+    def __init__(self, path: str, profile: Profile, resolve_variables: bool = True):
+        self.path = path
+        if resolve_variables:
+            self.paths = self._path_parser([self._resolve_variables(path, profile)], profile)
+        else:
+            self.paths = self._path_parser([path], profile)
+
+    def match(self, path: str) -> bool:
+        for p in self.paths:
+            if "*" in p:
+                if RegularExpression(p).match(path):
+                    return True
+            elif p == path:
+                return True
+        return False
+
+    def match_path(self, path) -> bool:
+        """
+	Returns whether the provided match is entirely encompassed by the caller.
+	"""
+        if path.path == self.path:
+            return True
+        for p in path.paths:
+            if not self.match(p):
+                return False
+        return True
+
+    def __eq__(self, path) -> bool:
+        if self.path != path.path:
+            return False
+        for p in self.paths:
+            if not p in path.paths:
+                return False
+        return True
+
+
+class CommandLineArgument:
+    def __init__(self, long: str, help: str, type: str):
+        self.long = long
+        self.help = help
+        self.type = type
+
+
+c_args = {
+    "verbose": [CommandLineArgument("verbose", "Prints verbose messages", "set"), False],
+    "dry": [
+        CommandLineArgument("dry", "Does not write any files, just runs and outputs changed files to standard output",
+                            "set"), False],
+    "profile": [CommandLineArgument("profile",
+                                    "Selectively choose which profiles to run. One profile per switch, can be used multiple times",
+                                    "list"), []],
+    "enable": [CommandLineArgument("enable",
+                                   "Seletively choose which tests to be run. One test per switch, can be used multiple times. If used, any test not explicitly enabled will not be run",
+                                   "list"), []],
+    "help": [CommandLineArgument("help", "Output help dialog. If set, no testing is done, regardless of other switches",
+                                 "set"), False],
+}
+
+
+def profile_whitelist(profile_name: str, profile: Profile):
+    global c_args
+    if len(c_args["profile"][1]) == 0:
+        return True
+
+    path_profile = Path(profile_name, profile)
+    for path in c_args["profile"][1]:
+        if path_profile.match(path):
+            return True
+    return False
+
+
+def profile_issue(path: str, profile: Profile, issue: str, color: str):
+    if not path:
+        return
+    message = "Profile: " + path
+    if profile.parent is not None:
+        message += " (Child of {})".format(profile.parent.path)
+    message += " => " + issue
+    print(colored(message, color))
+
+
+def permission_order(permissions: list[str]) -> str:
+    out = ""
+    for permission in ["r", "w", "l", "k", "m", "x"]:
+        for provided_permission in permissions:
+            if permission in provided_permission and permission not in out:
+                if permission == "x":
+                    x_location = provided_permission.find("x")
+                    out += provided_permission[x_location - 1:x_location + 1]
+                else:
+                    out += permission
+    return out
+
+
+def bounder(path: str, location: int = 0) -> str:
+    start = path.find("{", location)
+    while start != 0 and path[start - 1] == "@":
+        start = path.find("{", start + 1)
+    running = start + 1
+    while True:
+        next = path.find("{", running)
+        close = path.find("}", running)
+        if running == 0 or path[running - 1] != "@":
+            if next > close or next == -1:
+                running = close
+                break
+        running = close + 1
+    if running != len(path) - 1:
+        if path[running + 1] == '}':
+            return path[start:running + 2]
+    return path[start:running + 1]
+
+
+def splitter(path: str) -> list:
+    running = path.find(",")
+    while running != -1:
+        left = path.rfind("{", 0, running)
+        right = path.find("}", running)
+        if left != 0 and right != len(path) - 1:
+            path = path[:running] + "|" + path[running + 1:]
+        running = path.find(",", running + 1)
+    split = path.split(",")
+    for x in range(len(split)):
+        split[x] = split[x].replace("|", ",")
+    split[0] = split[0][1:]
+    split[-1] = split[-1][:-1]
+    return split
+
+
+def get_variables(profile: Profile) -> dict:
+    ret = profile.variables.copy()
+    for include in profile.local_includes + profile.global_includes:
+        header = get_header(include)
+        if header is not None:
+            ret |= get_variables(header)
+    return ret
+
+
+def get_rules(profile: Profile) -> dict:
+    ret = profile.values.copy()
+    for include in profile.local_includes + profile.global_includes:
+        header = get_header(include)
+        if header is not None:
+            ret |= get_rules(header)
+    return ret
+
+
+def get_indices(profile: Profile):
+    profile.indices["variables"] = deepcopy(get_variables(profile))
+    for include in profile.local_includes + profile.global_includes:
+        header = get_header(include)
+        if header is not None:
+            profile.indices["values"] |= deepcopy(get_rules(header))
+    for child in profile.children:
+        get_indices(child)
+
+
+def permission_within(parent: str, permission: str) -> bool:
+    for p in permission:
+        if p not in parent:
+            return False
+    return True
+
+
+def profile_parser(filename: str, header: bool = False) -> list:
+    global combined_rules
+    file = open(filename, "r")
+    raw = file.read().split("\n")
+
+    global_includes = []
+    global_vars = {}
+
+    ret = []
+
+    if header:
+        ret.append(Profile())
+        current = ret[-1]
+        current.header = True
+        in_profile = True
+    else:
+        current = None
+        in_profile = False
+
+    for line in raw:
+        stripped = line.strip()
+
+        if stripped.startswith("#") or stripped == "" or stripped == "\n" or stripped.startswith("abi"):
+            continue
+
+        elif stripped.endswith("{") or stripped.startswith("profile"):
+            if in_profile:
+                current.children.append(Profile())
+                current.children[-1].parent = current
+                current = current.children[-1]
+                current.global_includes = current.parent.global_includes.copy() + current.parent.local_includes.copy()
+                current.variables = current.parent.variables.copy()
+                current.header = header
+            else:
+                in_profile = True
+                ret.append(Profile())
+                current = ret[-1]
+                current.global_includes = global_includes.copy()
+                current.variables = global_vars.copy()
+                current.header = header
+
+            split = stripped.split(" ")
+            for string in split:
+                if string.startswith("flags="):
+                    current.flags = string
+                elif "/" in string:
+                    current.path = string
+                elif string in ["profile", "{"]:
+                    pass
+                else:
+                    if current.name == "":
+                        current.name = string
+                    else:
+                        current.flags += string
+
+            if profile_whitelist(current.path, current):
+                if current.name == "":
+                    profile_issue(current.path, current, "Profile has no name. Consider adding one.", "green")
+                if "profile" not in split:
+                    profile_issue(current.path, current,
+                                  "Profile does not use the profile keyword. It will be added if modifications are made",
+                                  "yellow")
+
+        elif stripped == "}":
+            if in_profile:
+                if current.parent is not None:
+                    current = current.parent
+                else:
+                    in_profile = False
+
+        elif stripped.startswith("include"):
+            if stripped.startswith("include if exists"):
+                stripped = stripped.replace("include if exists", "include")
+            included = stripped.split(" ")[1][1:-1]
+            if in_profile:
+                current.local_includes.append(included)
+            else:
+                global_includes.append(included)
+
+        elif stripped.startswith(("/", "@", "owner")):
+            # Variable
+            if stripped.startswith("@") and "=" in stripped:
+                split = stripped.split('=')
+                if current is None:
+                    global_vars[split[0].strip()] = split[1].strip()
+                else:
+                    current.variables[split[0].strip()] = split[1].strip()
+            else:
+                split = stripped.split()
+                path = " ".join(split[:-1])
+                permission = split[-1][:-1]
+                if not header and path in current.values:
+                    combined_rules += 1
+                    profile_issue(current.path, current, " ".join(
+                        ["Profile has duplicate rule:", path, permission, "and", current.values[path],
+                         " Will be concatenated"]), "yellow")
+                    current.values[path] = permission_order([current.values[path], permission])
+                    current.modified = True
+                else:
+                    current.values[path] = permission
+        else:
+            current.unsupported.append(stripped)
+    return ret
+
+
+def profile_string(profiles: list, tabs: int = 0, globals_defined: bool = False):
+    string = ""
+
+    for profile in profiles:
+        if not globals_defined:
+            globals_defined = True
+            string += "abi <abi/3.0>,\n\n"
+            if len(profile.global_includes) != 0:
+                for include in profile.global_includes:
+                    string += "include <{}>\n".format(include)
+                string += "\n"
+            if len(profile.variables) != 0:
+                for key, value in profile.variables.items():
+                    string += key + "=" + value + "\n"
+                string += "\n"
+
+        string += "\t" * tabs + "profile "
+        if profile.name != "":
+            string += profile.name + " "
+        string += profile.path
+        if profile.flags != "":
+            string += " " + profile.flags
+        string += " {\n"
+
+        if len(profile.local_includes) != 0:
+            for include in profile.local_includes:
+                string += "\t" * (tabs + 1) + "include <{}>\n".format(include)
+            string += "\n"
+
+        if len(profile.unsupported) != 0:
+            for line in profile.unsupported:
+                string += "\t" * (tabs + 1) + line + "\n"
+            string += "\n"
+
+        if len(profile.values) != 0:
+            for key, value in profile.values.items():
+                if (key and key != "owner") and value:
+                    string += "\t" * (tabs + 1) + key + " " + value + ",\n"
+            string += "\n"
+
+        if len(profile.children) != 0:
+            string += profile_string(profile.children, tabs + 1, True)
+
+        string += "\t" * tabs + "}\n"
+    return string
+
+
+def find_invalid_executables(permission: str, path: Path, local: Profile, profiles):
+    global invalid_exec
+
+    if "x" in permission:
+        if "i" in permission.lower() or "u" in permission.lower():
+            return
+
+        if "c" in permission.lower():
+            found = False
+            for child in local.children:
+                if Path(child.path, child).match_path(path):
+                    found = True
+                    break
+            if not found and not (path.path.endswith("*") or path.path.endswith("}")):
+                invalid_exec += 1
+                profile_issue(local.path, local,
+                              "Child profile for executable " + path.path + " defined, but it does not exist!",
+                              "red")
+
+        elif "p" in permission.lower():
+            found = False
+            for l_profile in profiles.values():
+                for l_local in l_profile:
+                    if Path(l_local.path, l_local).match_path(path):
+                        found = True
+                        break
+            if not found and not (path.path.endswith("*") or path.path.endswith("}")):
+                invalid_exec += 1
+                profile_issue(local.path, local,
+                              "Profile for executable " + path.path + " defined, but it does not exist!", "red")
+
+
+def find_duplicated_rules(permission: str, path: Path, local: Profile):
+    global combined_rules
+    for l_path, l_permission in deepcopy(local.values).items():
+        ll_path = Path(l_path, local)
+        if ll_path == path:
+            continue
+
+        if path.match_path(ll_path) and permission_within(permission, l_permission):
+            if l_path in local.values:
+                combined_rules += 1
+                profile_issue(local.path, local, " ".join(
+                    ["Contains redundant rule", l_path, l_permission, "which is contained within the rule " + path.path,
+                     permission]), "yellow")
+                local.modified = True
+                try:
+                    local.values.pop(l_path)
+                except KeyError: 
+                    pass
+
+def find_inherited_rules(permission: str, path: Path, local: Profile):
+    global combined_rules
+    for l_path, l_permission in local.indices["values"].items():
+        ll_path = Path(l_path, local)
+
+        if ll_path.match_path(path) and permission_within(l_permission, permission):
+            combined_rules += 1
+            profile_issue(local.path, local, " ".join(
+                ["Contains redundant rule", path.path, permission, "which is contained within the rule ", l_path,
+                    l_permission, "from abstraction"]), "yellow")
+            local.modified = True
+            try:
+                local.values.pop(path.path)
+            except KeyError:
+                pass
+            return
+
+def get_header(include: str):
+    global abstractions, tunables
+    if include.startswith("tunables"):
+        tunable = include.split("/")[1]
+        if tunable in tunables:
+            return tunables[tunable][0]
+    elif include.startswith("abstractions"):
+        abstraction = include.split("/")[1]
+        if abstraction in abstractions:
+            return abstractions[abstraction][0]
+    return None
+
+
+def find_variable_substitutions(permission: str, path: Path, local: Profile):
+    global substitutions, global_variables
+    to_remove = []
+    to_add = {}
+
+    includes = local.local_includes + local.global_includes
+    for include in local.local_includes + local.global_includes:
+        i_profile = get_header(include)
+        if i_profile is None:
+            continue
+        for i_include in i_profile.local_includes + i_profile.global_includes:
+            if i_include not in includes:
+                includes.append(i_include)
+
+    for include in includes:
+        i_profile = get_header(include)
+        if i_profile is None:
+            continue
+
+        # Replace with globals
+        for variable, value in global_variables.items():
+            i_profile.variables[variable] = value
+
+        for variable, value in i_profile.variables.items():
+            found = False
+
+            for p in path.paths:
+                if p.startswith(value) or p.startswith("owner " + value):
+                    found = True
+                    break
+
+            if found:
+                if path.path in local.values:
+                    if value in bastardization_rules and bastardization_rules[value] == variable:
+                        continue
+
+                    substitutions += 1
+                    profile_issue(local.path, local,
+                                  " ".join([path.path, "Can use variable", variable, "instead of", value]), "yellow")
+                    if value.endswith("/"):
+                        value = value[:-1]
+                    try:
+                        local.values.pop(path.path)
+                        local.values[path.path.replace(value, variable)] = permission
+                        local.modified = True
+                    except KeyError: 
+                        pass
+
+
+def find_same_path(permission: str, path: Path, local: Profile):
+    if path.path not in local.values:
+        return
+
+    global combined_rules
+    s_path = path.path.split('/')
+    path_no_file = "/".join(s_path[:-1])
+    value = s_path[-1]
+    current_path = path.path
+
+    for l_path, l_permission in deepcopy(local.values).items():
+        if l_path == current_path:
+            continue
+
+        lr_path = Path(l_path, local)
+        ls_path = lr_path.path.split('/')
+        ll_path = "/".join(ls_path[:-1])
+        lv_path = ls_path[-1]
+
+        if path_no_file == ll_path and permission == l_permission:
+            working = path_no_file + "/"
+            if value.startswith("{") or lv_path.startswith("{"):
+                if value.startswith("{") and lv_path.startswith("{"):
+                    end = ",".join(set(value[1:-1].split(",") + lv_path[1:-1].split(",")))
+                elif value.startswith("{"):
+                    if lv_path not in value:
+                        end = value[:-1] + "," + lv_path + "}"
+                    else:
+                        end = value
+                else:
+                    if value not in lv_path:
+                        end = lv_path[:-1] + "," + value + "}"
+                    else:
+                        end = lv_path
+            else:
+                if value != lv_path:
+                    end = "{" + value + "," + lv_path + "}"
+                else:
+                    end = value
+            working += end
+
+            combined_rules += 1
+            profile_issue(local.path, local, " ".join(
+                ["Contains redundant rule", l_path, l_permission, "which can be combined with", path.path, permission,
+                 "to form", working]), "yellow")
+            local.modified = True
+            local.values.pop(current_path)
+            try:
+                local.values.pop(l_path)
+            except KeyError:
+                pass
+            local.values[working] = permission
+            current_path = working
+            value = end
+
+
+def recursive_find(include, second):
+    if include == second or second is None:
+        return False
+    if include in second.local_includes:
+        return True
+    for third in second.local_includes:
+        if recursive_find(include, get_header(third)):
+            return True
+    return False
+
+def run_fixes(local: Profile, profiles):
+
+    extra_includes = []
+    for include in local.local_includes:
+        for second in local.local_includes:
+            if recursive_find(include, get_header(second)) and include not in extra_includes:
+                profile_issue(include, local, "Redundant include already present in " + second, "yellow")
+                extra_includes.append(include)
+    for extra in extra_includes:
+        local.local_includes.remove(extra)
+        local.modified = True
+
+    for path, permission in deepcopy(local.values).items():
+        if len(c_args["enable"][1]) == 0 or "invalid" in c_args["enable"][1]:
+            find_invalid_executables(permission, Path(path, local), local, profiles)
+        if len(c_args["enable"][1]) == 0 or "duplicates" in c_args["enable"][1]:
+            find_duplicated_rules(permission, Path(path, local), local)
+            find_inherited_rules(permission, Path(path, local), local)
+        if len(c_args["enable"][1]) == 0 or "substitutions" in c_args["enable"][1]:
+            find_variable_substitutions(permission, Path(path, local, False), local)
+        if len(c_args["enable"][1]) == 0 or "combine" in c_args["enable"][1]:
+            find_same_path(permission, Path(path, local, False), local)
+        pass
+
+
+def main():
+    global substitutions, invalid_exec, combined_rules, c_args, abstractions, tunables
+
+    arguments = " ".join(sys.argv[1:]).split(" --")
+    arguments[0] = arguments[0][2:]
+
+    for argument in arguments:
+        if argument == "":
+            continue
+        entry = None
+        args = argument.split(" ")
+        for c_arg in c_args.values():
+            if c_arg[0].long == args[0]:
+                entry = c_arg[0]
+        if entry is None:
+            print("Invalid command line argument")
+            exit(-1)
+
+        if entry.type == "set":
+            if len(args) > 1:
+                print("Invalid command line argument")
+                exit(-1)
+            c_args[entry.long][1] = True
+        elif entry.type == "list":
+            if len(args) > 2:
+                print("Invalid command line argument")
+                exit(-1)
+            c_args[entry.long][1].append(args[1])
+
+    if c_args["help"][1]:
+        print("aa-lint: A program to help clean AppArmor Profiles")
+        for value in c_args.values():
+            print("--" + ": ".join([value[0].long, value[0].help]))
+        return
+
+    # Get the main profiles.
+    profiles = {}
+    for filename in os.listdir(apparmor_dir):
+        file = os.path.join(apparmor_dir, filename)
+        # checking if it is a file
+        if os.path.isfile(file):
+            profiles[filename] = profile_parser(file)
+
+    # Add tunable and abstractions. This is all we support.
+    for definition, string in [(tunables, "tunables/"), (abstractions, "abstractions/")]:
+        for filename in os.listdir(apparmor_dir + string):
+            file = os.path.join(apparmor_dir + string, filename)
+            # checking if it is a file
+            if os.path.isfile(file):
+                definition[filename] = profile_parser(file, True)
+
+    for profile in profiles.values():
+        for p in profile:
+            get_indices(p)
+
+    for profile in profiles.values():
+        for local in profile:
+            if local.header:
+                continue
+            run_fixes(local, profiles)
+            for child in local.children:
+                run_fixes(child, profiles)
+
+    print("""
+Found Issues:
+Substitutions: {} (Rules which used a path that was defined by a variable the profile included, such as HOMEDIRS as /home/)
+Invalid Executables: {} (Profiles that defined Px or Cx permissions for an executable that does not have a profile or sub-profile. AppArmor will silently deny this request, and it won't be logged)
+Combined Rules: {} (Rules which defined the same path, but had differing permissions. Such as /bin/bash ix and /bin/bash mr. They would be combined into a single rule, /bin/bash mrix)
+""".format(substitutions, invalid_exec, combined_rules))
+
+    print("Modified profiles: (You may want to verify that the linter did not create any errors)")
+    for path, profile in profiles.items():
+
+        for local in profile:
+            modified = local.modified
+            if not modified:
+                for child in local.children:
+                    if child.modified:
+                        modified = True
+                        break
+            if modified and local.path != "":
+                print("".join(["\t", local.path]))
+                open(apparmor_dir + path, "w").write(profile_string(profile))
+
+
+if __name__ == "__main__":
+    main()
