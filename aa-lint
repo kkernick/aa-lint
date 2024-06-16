@@ -609,8 +609,10 @@ def find_same_path(permission: str, path: Path, local: Profile):
                 ["Contains redundant rule", l_path, l_permission, "which can be combined with", path.path, permission,
                  "to form", working]), "yellow")
             local.modified = True
-            local.values.pop(current_path)
-            local.values.pop(l_path)
+            if current_path in local.values:
+                local.values.pop(current_path)
+            if l_path in local.values:
+                local.values.pop(l_path)
             local.values[working] = permission
             current_path = working
             value = end

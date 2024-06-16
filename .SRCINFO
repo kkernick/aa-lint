@@ -1,6 +1,6 @@
 pkgbase = aa-lint-git
 	pkgdesc = Lint AppArmor Profiles
-	pkgver = 1
+	pkgver = r4.a3236c3
 	pkgrel = 1
 	arch = any
 	depends = python
