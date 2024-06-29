@@ -734,8 +734,10 @@ Combined Rules: {} (Rules which defined the same path, but had differing permiss
                         modified = True
                         break
             if modified and local.path != "":
-                print("".join(["\t", local.path]))
-                open(apparmor_dir + path, "w").write(profile_string(profile))
+                try:
+                    print("".join(["\t", local.path]))
+                    open(apparmor_dir + path, "w").write(profile_string(profile))
+                except PermissionError: pass
 
 
 if __name__ == "__main__":
