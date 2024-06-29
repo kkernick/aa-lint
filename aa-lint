@@ -501,7 +501,7 @@ def find_inherited_rules(permission: str, path: Path, local: Profile):
                 ["Contains redundant rule", path.path, permission, "which is contained within the rule ", l_path,
                     l_permission, "from abstraction"]), "yellow")
             local.modified = True
-            local.values.pop(path.path)
+            if path.path in local.values: local.values.pop(path.path)
             return
 
 def get_header(include: str):
