@@ -694,7 +694,10 @@ def main():
         file = os.path.join(apparmor_dir, filename)
         # checking if it is a file
         if os.path.isfile(file):
-            profiles[filename] = profile_parser(file)
+            try:
+                open(file, "w")
+                profiles[filename] = profile_parser(file)
+            except PermissionError: pass
 
     # Add tunable and abstractions. This is all we support.
     for definition, string in [(tunables, "tunables/"), (abstractions, "abstractions/")]:
